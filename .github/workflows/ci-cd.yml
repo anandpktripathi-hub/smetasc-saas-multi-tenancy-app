@@ -1,82 +1,442 @@
-name: CI/CD Pipeline
+name: CI/CD
 
 on:
   push:
-    branches: [main]
+    branches:
+      - main
+      - feature/**
   pull_request:
-    branches: [main]
+    branches:
+      - main
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  build-test:
+  backend:
+    name: Backend (build & test)
     runs-on: ubuntu-latest
     services:
       mongo:
-        image: mongo:7.0
-        ports: [27017:27017]
+        image: mongo:7
+        ports:
+          - 27017:27017
+        options: >-
+          --health-cmd "mongosh --eval 'db.runCommand({ ping: 1 })'" --health-interval 10s --health-timeout 5s --health-retries 10
       redis:
         image: redis:7
-        ports: [6379:6379]
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping" --health-interval 10s --health-timeout 5s --health-retries 10
     env:
       NODE_ENV: test
       DATABASE_URI: mongodb://localhost:27017/test-db
       REDIS_HOST: localhost
-      REDIS_PORT: 6379
+      REDIS_PORT: "6379"
       JWT_SECRET: test-secret
     steps:
       - uses: actions/checkout@v4
-      - name: Set up Node.js
+
+      - name: Setup Node
         uses: actions/setup-node@v4
         with:
           node-version: 22
-      - name: Install backend dependencies
-        run: |
-          cd backend
-          npm install --legacy-peer-deps
-      - name: Build backend
-        run: |
-          cd backend
-          npm run build
-      - name: Run backend tests
-        run: |
-          cd backend
-          npm test || true
-      - name: Install frontend dependencies
-        run: |
-          cd frontend
-          npm install --legacy-peer-deps
-      - name: Build frontend
-        run: |
-          cd frontend
-          npm run build
-      - name: Run frontend tests
-        run: |
-          cd frontend
-          npm test || true
+          cache: npm
+          cache-dependency-path: backend/package-lock.json
 
-  docker-publish:
-    needs: build-test
+      - name: Install
+        working-directory: backend
+        run: npm ci --legacy-peer-deps
+
+      - name: Typecheck
+        working-directory: backend
+        run: npm run build:typecheck --if-present
+
+      - name: Build
+        working-directory: backend
+        run: npm run build
+
+      - name: Test
+        working-directory: backend
+        run: npm test --if-present
+
+  frontend:
+    name: Frontend (build & test)
     runs-on: ubuntu-latest
-    if: github.ref == 'refs/heads/main'
     steps:
       - uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install
+        working-directory: frontend
+        run: npm ci --legacy-peer-deps
+
+      - name: Build
+        working-directory: frontend
+        run: npm run build
+
+      - name: Test
+        working-directory: frontend
+        run: npm test --if-present
+
+  docker-publish:
+    name: Publish Docker images (GHCR)
+    needs: [backend, frontend]
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
-      - name: Login to DockerHub
+
+      - name: Login to GHCR
         uses: docker/login-action@v3
         with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Build and push backend image
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@v6
         with:
           context: ./backend
           file: ./backend/Dockerfile
           push: true
-          tags: ${{ secrets.DOCKERHUB_USERNAME }}/master-platform-backend:latest
+          tags: |
+            ghcr.io/${{ github.repository }}-backend:latest
+            ghcr.io/${{ github.repository }}-backend:${{ github.sha }}
+
       - name: Build and push frontend image
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@v6
         with:
           context: ./frontend
           file: ./frontend/Dockerfile
           push: true
-          tags: ${{ secrets.DOCKERHUB_USERNAME }}/master-platform-frontend:latest
+          tags: |
+            ghcr.io/${{ github.repository }}-frontend:latest
+            ghcr.io/${{ github.repository }}-frontend:${{ github.sha }}
+
+  deploy-selfhosted-windows:
+    name: Deploy (Self-hosted Windows runner)
+    needs: docker-publish
+    runs-on: [self-hosted, windows]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push' && vars.ENABLE_SELF_HOSTED_DEPLOY == 'true'
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Write .env (required)
+        shell: pwsh
+        run: |
+          if ([string]::IsNullOrWhiteSpace('${{ secrets.JWT_SECRET }}')) {
+            throw 'Missing secret JWT_SECRET (required for docker-compose.prod.yml)'
+          }
+
+          $frontendUrl = '${{ secrets.FRONTEND_URL }}'
+          if ([string]::IsNullOrWhiteSpace($frontendUrl)) {
+            $frontendUrl = '${{ secrets.CORS_ORIGIN }}'
+          }
+
+          @(
+            "JWT_SECRET=${{ secrets.JWT_SECRET }}",
+            "DATABASE_URI=${{ secrets.DATABASE_URI }}",
+            "REDIS_URL=${{ secrets.REDIS_URL }}",
+            "FRONTEND_URL=$frontendUrl",
+            "CORS_ORIGIN=${{ secrets.CORS_ORIGIN }}",
+            "LOG_LEVEL=${{ secrets.LOG_LEVEL }}"
+          ) | Where-Object { $_ -notmatch '=$' } | Set-Content -Encoding UTF8 .env
+
+      - name: Pull & Up
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          try { docker compose version | Out-Null; $usePlugin = $true } catch { $usePlugin = $false }
+          if ($usePlugin) {
+            docker compose -f docker-compose.prod.yml pull
+            docker compose -f docker-compose.prod.yml up -d --remove-orphans
+          } else {
+            docker-compose -f docker-compose.prod.yml pull
+            docker-compose -f docker-compose.prod.yml up -d --remove-orphans
+          }
+
+  deploy-docker:
+    name: Deploy (Docker Compose over SSH)
+    needs: docker-publish
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    env:
+      DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+      DEPLOY_OS: ${{ secrets.DEPLOY_OS }}
+    steps:
+      - name: Skip deploy (missing secrets)
+        if: env.DEPLOY_HOST == ''
+        run: echo "[deploy] DEPLOY_HOST secret not set; skipping server deploy."
+
+      - name: Deploy via SSH (Linux)
+        if: env.DEPLOY_HOST != '' && env.DEPLOY_OS != 'windows'
+        uses: appleboy/ssh-action@v1.2.0
+        env:
+          JWT_SECRET: ${{ secrets.JWT_SECRET }}
+          DATABASE_URI: ${{ secrets.DATABASE_URI }}
+          REDIS_URL: ${{ secrets.REDIS_URL }}
+          FRONTEND_URL: ${{ secrets.FRONTEND_URL }}
+          CORS_ORIGIN: ${{ secrets.CORS_ORIGIN }}
+          LOG_LEVEL: ${{ secrets.LOG_LEVEL }}
+        with:
+          host: ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          envs: JWT_SECRET,DATABASE_URI,REDIS_URL,FRONTEND_URL,CORS_ORIGIN,LOG_LEVEL
+          script: |
+            set -e
+
+            if ! command -v docker >/dev/null 2>&1; then
+              echo "docker is not installed on the server" >&2
+              exit 1
+            fi
+
+            if docker compose version >/dev/null 2>&1; then
+              DOCKER_COMPOSE="docker compose"
+            elif command -v docker-compose >/dev/null 2>&1; then
+              DOCKER_COMPOSE="docker-compose"
+            else
+              echo "docker compose (plugin) or docker-compose is required on the server" >&2
+              exit 1
+            fi
+
+            APP_DIR="${{ secrets.DEPLOY_PATH }}"
+            if [ -z "$APP_DIR" ]; then
+              APP_DIR="$HOME/smetasc-saas"
+            fi
+
+            mkdir -p "$APP_DIR"
+            cd "$APP_DIR"
+
+            # Optional: write a .env on the server from GitHub Secrets.
+            # If you prefer managing secrets on the server, simply don't set these secrets.
+            if [ -n "$JWT_SECRET" ]; then
+              FRONTEND_URL_EFFECTIVE="$FRONTEND_URL"
+              if [ -z "$FRONTEND_URL_EFFECTIVE" ]; then
+                FRONTEND_URL_EFFECTIVE="$CORS_ORIGIN"
+              fi
+
+              {
+                echo "JWT_SECRET=$JWT_SECRET"
+                [ -n "$DATABASE_URI" ] && echo "DATABASE_URI=$DATABASE_URI" || true
+                [ -n "$REDIS_URL" ] && echo "REDIS_URL=$REDIS_URL" || true
+                [ -n "$FRONTEND_URL_EFFECTIVE" ] && echo "FRONTEND_URL=$FRONTEND_URL_EFFECTIVE" || true
+                [ -n "$LOG_LEVEL" ] && echo "LOG_LEVEL=$LOG_LEVEL" || true
+                [ -n "$CORS_ORIGIN" ] && echo "CORS_ORIGIN=$CORS_ORIGIN" || true
+              } > .env
+              chmod 600 .env || true
+            else
+              echo "[deploy] JWT_SECRET secret not set; not writing .env on server."
+            fi
+
+            # Write compose file from the repo template so the server doesn't need git.
+            cat > docker-compose.prod.yml <<'YAML'
+            services:
+              mongodb:
+                image: mongo:7.0
+                ports:
+                  - "27017:27017"
+                volumes:
+                  - mongodb_data:/data/db
+                environment:
+                  MONGO_INITDB_DATABASE: smetasc-saas
+                networks:
+                  - smetasc-network
+                restart: unless-stopped
+
+              redis:
+                image: redis:7-alpine
+                ports:
+                  - "6379:6379"
+                networks:
+                  - smetasc-network
+                restart: unless-stopped
+
+              backend:
+                image: ghcr.io/${{ github.repository }}-backend:latest
+                ports:
+                  - "4000:4000"
+                environment:
+                  DATABASE_URI: ${DATABASE_URI:-mongodb://mongodb:27017/smetasc-saas}
+                  REDIS_URL: ${REDIS_URL:-redis://redis:6379}
+                  JWT_SECRET: ${JWT_SECRET:?JWT_SECRET is required}
+                  NODE_ENV: production
+                  PORT: 4000
+                  LOG_LEVEL: ${LOG_LEVEL:-info}
+                  FRONTEND_URL: ${FRONTEND_URL:-http://localhost}
+                  CORS_ORIGIN: ${CORS_ORIGIN:-http://localhost}
+                depends_on:
+                  - mongodb
+                  - redis
+                networks:
+                  - smetasc-network
+                restart: unless-stopped
+
+              frontend:
+                image: ghcr.io/${{ github.repository }}-frontend:latest
+                ports:
+                  - "80:80"
+                depends_on:
+                  - backend
+                networks:
+                  - smetasc-network
+                restart: unless-stopped
+
+            volumes:
+              mongodb_data:
+
+            networks:
+              smetasc-network:
+                driver: bridge
+            YAML
+
+            # Login to GHCR on the server (required if the package is private).
+            if [ -n "${{ secrets.GHCR_USERNAME }}" ] && [ -n "${{ secrets.GHCR_TOKEN }}" ]; then
+              echo "${{ secrets.GHCR_TOKEN }}" | docker login ghcr.io -u "${{ secrets.GHCR_USERNAME }}" --password-stdin
+            else
+              echo "[deploy] GHCR creds not set; assuming images are public or server is already logged in."
+            fi
+
+            $DOCKER_COMPOSE -f docker-compose.prod.yml pull
+            $DOCKER_COMPOSE -f docker-compose.prod.yml up -d --remove-orphans
+
+            echo "[deploy] Done."
+
+      - name: Deploy via SSH (Windows / PowerShell)
+        if: env.DEPLOY_HOST != '' && env.DEPLOY_OS == 'windows'
+        uses: appleboy/ssh-action@v1.2.0
+        env:
+          JWT_SECRET: ${{ secrets.JWT_SECRET }}
+          DATABASE_URI: ${{ secrets.DATABASE_URI }}
+          REDIS_URL: ${{ secrets.REDIS_URL }}
+          FRONTEND_URL: ${{ secrets.FRONTEND_URL }}
+          CORS_ORIGIN: ${{ secrets.CORS_ORIGIN }}
+          LOG_LEVEL: ${{ secrets.LOG_LEVEL }}
+        with:
+          host: ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          envs: JWT_SECRET,DATABASE_URI,REDIS_URL,FRONTEND_URL,CORS_ORIGIN,LOG_LEVEL
+          script: |
+            powershell -NoProfile -NonInteractive -Command "$ErrorActionPreference='Stop'; \
+              if (-not (Get-Command docker -ErrorAction SilentlyContinue)) { throw 'docker is not installed on the server' }; \
+              $usePlugin = $false; \
+              try { docker compose version | Out-Null; $usePlugin = $true } catch { $usePlugin = $false }; \
+              $hasStandalone = $false; \
+              if (-not $usePlugin) { try { docker-compose version | Out-Null; $hasStandalone = $true } catch { $hasStandalone = $false } }; \
+              if (-not $usePlugin -and -not $hasStandalone) { throw 'docker compose (plugin) or docker-compose is required on the server' }; \
+              $appDir = '${{ secrets.DEPLOY_PATH }}'; \
+              if ([string]::IsNullOrWhiteSpace($appDir)) { $appDir = Join-Path $env:USERPROFILE 'smetasc-saas' }; \
+              New-Item -ItemType Directory -Force -Path $appDir | Out-Null; \
+              Set-Location $appDir; \
+              if (-not [string]::IsNullOrWhiteSpace($env:JWT_SECRET)) { \
+                $frontendUrl = $env:FRONTEND_URL; \
+                if ([string]::IsNullOrWhiteSpace($frontendUrl)) { $frontendUrl = $env:CORS_ORIGIN }; \
+                $lines = @("JWT_SECRET=$($env:JWT_SECRET)"); \
+                if ($env:DATABASE_URI) { $lines += "DATABASE_URI=$($env:DATABASE_URI)" }; \
+                if ($env:REDIS_URL) { $lines += "REDIS_URL=$($env:REDIS_URL)" }; \
+                if ($frontendUrl) { $lines += "FRONTEND_URL=$frontendUrl" }; \
+                if ($env:LOG_LEVEL) { $lines += "LOG_LEVEL=$($env:LOG_LEVEL)" }; \
+                if ($env:CORS_ORIGIN) { $lines += "CORS_ORIGIN=$($env:CORS_ORIGIN)" }; \
+                $lines | Set-Content -Encoding UTF8 .env; \
+              } else { \
+                Write-Host '[deploy] JWT_SECRET secret not set; not writing .env on server.'; \
+              }; \
+              $compose = @(
+                'services:',
+                '  mongodb:',
+                '    image: mongo:7.0',
+                '    ports:',
+                '      - "27017:27017"',
+                '    volumes:',
+                '      - mongodb_data:/data/db',
+                '    environment:',
+                '      MONGO_INITDB_DATABASE: smetasc-saas',
+                '    networks:',
+                '      - smetasc-network',
+                '    restart: unless-stopped',
+                '',
+                '  redis:',
+                '    image: redis:7-alpine',
+                '    ports:',
+                '      - "6379:6379"',
+                '    networks:',
+                '      - smetasc-network',
+                '    restart: unless-stopped',
+                '',
+                '  backend:',
+                '    image: ghcr.io/${{ github.repository }}-backend:latest',
+                '    ports:',
+                '      - "4000:4000"',
+                '    environment:',
+                '      DATABASE_URI: ${DATABASE_URI:-mongodb://mongodb:27017/smetasc-saas}',
+                '      REDIS_URL: ${REDIS_URL:-redis://redis:6379}',
+                '      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET is required}',
+                '      NODE_ENV: production',
+                '      PORT: 4000',
+                '      LOG_LEVEL: ${LOG_LEVEL:-info}',
+                '      FRONTEND_URL: ${FRONTEND_URL:-http://localhost}',
+                '      CORS_ORIGIN: ${CORS_ORIGIN:-http://localhost}',
+                '    depends_on:',
+                '      - mongodb',
+                '      - redis',
+                '    networks:',
+                '      - smetasc-network',
+                '    restart: unless-stopped',
+                '',
+                '  frontend:',
+                '    image: ghcr.io/${{ github.repository }}-frontend:latest',
+                '    ports:',
+                '      - "80:80"',
+                '    depends_on:',
+                '      - backend',
+                '    networks:',
+                '      - smetasc-network',
+                '    restart: unless-stopped',
+                '',
+                'volumes:',
+                '  mongodb_data:',
+                '',
+                'networks:',
+                '  smetasc-network:',
+                '    driver: bridge'
+              ) -join "`n"; \
+              $compose | Set-Content -Encoding UTF8 docker-compose.prod.yml; \
+              if ('${{ secrets.GHCR_USERNAME }}' -and '${{ secrets.GHCR_TOKEN }}') { \
+                '${{ secrets.GHCR_TOKEN }}' | docker login ghcr.io -u '${{ secrets.GHCR_USERNAME }}' --password-stdin | Out-Null; \
+              } else { \
+                Write-Host '[deploy] GHCR creds not set; assuming images are public or server is already logged in.'; \
+              }; \
+              if ($usePlugin) { \
+                docker compose -f docker-compose.prod.yml pull; \
+                docker compose -f docker-compose.prod.yml up -d --remove-orphans; \
+              } else { \
+                docker-compose -f docker-compose.prod.yml pull; \
+                docker-compose -f docker-compose.prod.yml up -d --remove-orphans; \
+              }; \
+              Write-Host '[deploy] Done.'"

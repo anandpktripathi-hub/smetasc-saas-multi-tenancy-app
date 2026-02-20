@@ -1,0 +1,63 @@
+services:
+  mongodb:
+    image: mongo:7.0
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongodb_data:/data/db
+    environment:
+      MONGO_INITDB_DATABASE: smetasc-saas
+    networks:
+      - smetasc-network
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    networks:
+      - smetasc-network
+    restart: unless-stopped
+
+  backend:
+    image: ${BACKEND_IMAGE:-ghcr.io/anandpktripathi-hub/smetasc-saas-multi-tenancy-app-backend:latest}
+    ports:
+      - "4000:4000"
+    environment:
+      DATABASE_URI: ${DATABASE_URI:-mongodb://mongodb:27017/smetasc-saas}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379}
+      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET is required}
+      NODE_ENV: production
+      PORT: 4000
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      FRONTEND_URL: ${FRONTEND_URL:-http://localhost}
+      CORS_ORIGIN: ${CORS_ORIGIN:-http://localhost}
+    depends_on:
+      - mongodb
+      - redis
+    networks:
+      - smetasc-network
+    restart: unless-stopped
+    healthcheck:
+      test:
+        ["CMD", "node", "-e", "require('http').get('http://localhost:4000/api/v1/health',r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1))"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  frontend:
+    image: ${FRONTEND_IMAGE:-ghcr.io/anandpktripathi-hub/smetasc-saas-multi-tenancy-app-frontend:latest}
+    ports:
+      - "80:80"
+    depends_on:
+      - backend
+    networks:
+      - smetasc-network
+    restart: unless-stopped
+
+volumes:
+  mongodb_data:
+
+networks:
+  smetasc-network:
+    driver: bridge
